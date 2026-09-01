@@ -1,0 +1,61 @@
+import crypto from 'node:crypto';
+import argon2 from 'argon2';
+import type { FastifyRequest, FastifyReply } from 'fastify';
+import type { PoolClient } from 'pg';
+import { Database } from '../infrastructure/db.js';
+import { ApiProblem } from './errors.js';
+
+export interface Principal { accountId: string; organizationId: string; collegeId: string; role: 'UNIVERSITY_ADMIN' | 'DEPARTMENT_ADMIN' | 'CLINICAL_SUPERVISOR' | 'STUDENT_INTEGRATION'; departmentIds: string[]; studentId?: string; }
+const SESSION_COOKIE = 'dp_session'; const CSRF_COOKIE = 'dp_csrf';
+const hash = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+const random = () => crypto.randomBytes(32).toString('base64url');
+
+export class AuthService {
+  constructor(private readonly db: Database, private readonly cookieSecure: boolean) {}
+  async login(organizationId: string, email: string, password: string, correlationId: string): Promise<{ principal: Principal; sessionValue: string; csrfToken: string }> {
+    return this.db.withTenant({ organizationId }, async (client) => {
+      const account = await client.query<{ id:string; organization_id:string; college_id:string; password_hash:string; status:'ACTIVE'|'DISABLED'|'PENDING'; primary_role:Principal['role']; student_id?:string }>('SELECT id, organization_id, college_id, password_hash, status, primary_role, student_id FROM accounts WHERE email=$1', [email]);
+      if (!account.rowCount || !(await argon2.verify(account.rows[0].password_hash, password))) { await this.auditAuth(client, organizationId, null, null, 'LOGIN_FAILED', correlationId); throw new ApiProblem(401, 'AUTHENTICATION_REQUIRED', 'Invalid email or password.'); }
+      const row = account.rows[0];
+      if (row.status !== 'ACTIVE') { await this.auditAuth(client, organizationId, row.id, row.primary_role, 'LOGIN_DENIED_ACCOUNT_STATUS', correlationId); throw new ApiProblem(403, 'ACCOUNT_DISABLED', 'Account is not active.'); }
+      const token = random(); const csrfToken = random(); const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000);
+      await client.query('UPDATE sessions SET revoked_at=now() WHERE account_id=$1 AND revoked_at IS NULL', [row.id]);
+      await client.query('INSERT INTO sessions(organization_id,account_id,token_hash,csrf_hash,expires_at) VALUES($1,$2,$3,$4,$5)', [organizationId,row.id,hash(token),hash(csrfToken),expiresAt]);
+      await client.query('UPDATE accounts SET last_login_at=now() WHERE id=$1', [row.id]); await this.auditAuth(client, organizationId, row.id, row.primary_role, 'LOGIN_SUCCEEDED', correlationId);
+      return { principal: await this.principalFor(client, row), sessionValue: `${organizationId}.${token}`, csrfToken };
+    });
+  }
+  setCookies(reply: FastifyReply, sessionValue: string, csrfToken: string): void {
+    reply.setCookie(SESSION_COOKIE, sessionValue, { httpOnly: true, secure: this.cookieSecure, sameSite: 'strict', path: '/', maxAge: 8 * 60 * 60, signed: false });
+    reply.setCookie(CSRF_COOKIE, csrfToken, { httpOnly: false, secure: this.cookieSecure, sameSite: 'strict', path: '/', maxAge: 8 * 60 * 60, signed: false });
+  }
+  clearCookies(reply: FastifyReply): void { reply.clearCookie(SESSION_COOKIE, { path: '/' }); reply.clearCookie(CSRF_COOKIE, { path: '/' }); }
+  async authenticate(request: FastifyRequest): Promise<Principal> {
+    const raw = request.cookies[SESSION_COOKIE]; const [organizationId, token] = raw?.split('.') ?? [];
+    if (!organizationId || !token || !/^[0-9a-f-]{36}$/i.test(organizationId)) throw new ApiProblem(401, 'AUTHENTICATION_REQUIRED', 'Authentication is required.');
+    return this.db.withTenant({ organizationId }, async (client) => {
+      const result = await client.query<{id:string; account_id:string; organization_id:string; expires_at:Date; revoked_at:Date|null; status:'ACTIVE'|'DISABLED'|'PENDING'; primary_role:Principal['role']; college_id:string; student_id?:string}>('SELECT s.id,s.account_id,s.organization_id,s.expires_at,s.revoked_at,a.status,a.primary_role,a.college_id,a.student_id FROM sessions s JOIN accounts a ON a.id=s.account_id WHERE s.token_hash=$1', [hash(token)]);
+      const session = result.rows[0];
+      if (!session || session.revoked_at || new Date(session.expires_at) <= new Date()) throw new ApiProblem(401, 'AUTHENTICATION_REQUIRED', 'Session is invalid or expired.');
+      if (session.status !== 'ACTIVE') throw new ApiProblem(403, 'ACCOUNT_DISABLED', 'Account is not active.');
+      const scopes = await client.query<{department_id:string}>('SELECT department_id FROM account_scopes WHERE account_id=$1 AND department_id IS NOT NULL', [session.account_id]);
+      return { accountId:session.account_id, organizationId:session.organization_id, collegeId:session.college_id, role:session.primary_role, departmentIds:scopes.rows.map((scope) => scope.department_id), ...(session.student_id ? { studentId: session.student_id } : {}) };
+    });
+  }
+  async assertCsrf(request: FastifyRequest, principal: Principal): Promise<void> {
+    if (['GET','HEAD','OPTIONS'].includes(request.method)) return;
+    const raw = request.cookies[SESSION_COOKIE]; const token = request.headers['x-csrf-token']; const [, sessionToken] = raw?.split('.') ?? [];
+    if (typeof token !== 'string' || request.cookies[CSRF_COOKIE] !== token || !sessionToken) throw new ApiProblem(403, 'CSRF_INVALID', 'CSRF validation failed.');
+    const valid = await this.db.withTenant(principal, async (client) => (await client.query('SELECT 1 FROM sessions WHERE account_id=$1 AND token_hash=$2 AND csrf_hash=$3 AND revoked_at IS NULL AND expires_at>now()', [principal.accountId,hash(sessionToken),hash(token)])).rowCount === 1);
+    if (!valid) throw new ApiProblem(403, 'CSRF_INVALID', 'CSRF validation failed.');
+  }
+  async logout(request: FastifyRequest, principal: Principal, correlationId: string): Promise<void> {
+    const [, token] = request.cookies[SESSION_COOKIE]?.split('.') ?? [];
+    if (!token) return;
+    await this.db.withTenant(principal, async (client) => { await client.query('UPDATE sessions SET revoked_at=now() WHERE account_id=$1 AND token_hash=$2 AND revoked_at IS NULL', [principal.accountId,hash(token)]); await this.auditAuth(client,principal.organizationId,principal.accountId,principal.role,'LOGOUT',correlationId); });
+  }
+  async issueInvitation(principal: Principal, email: string, role: Principal['role'], correlationId: string): Promise<string> { const token=random(); await this.db.withTenant(principal, async (client) => { await client.query('INSERT INTO invitations(organization_id,email,role,token_hash,expires_at,created_by_account_id) VALUES($1,$2,$3,$4,now()+interval \'72 hours\',$5)', [principal.organizationId,email,role,hash(token),principal.accountId]); await this.auditAuth(client,principal.organizationId,principal.accountId,principal.role,'INVITATION_ISSUED',correlationId); }); return token; }
+  async redeemInvitation(organizationId: string, token: string, password: string, correlationId: string): Promise<void> { await this.db.withTenant({organizationId}, async (client) => { const invitation = await client.query<{id:string;email:string;role:Principal['role']; expires_at:Date; used_at:Date|null; revoked_at:Date|null}>('SELECT id,email,role,expires_at,used_at,revoked_at FROM invitations WHERE token_hash=$1 FOR UPDATE',[hash(token)]); const item=invitation.rows[0]; if (!item || item.used_at || item.revoked_at || new Date(item.expires_at)<=new Date()) throw new ApiProblem(400,'INVITATION_INVALID','Invitation is invalid, expired, or already used.'); const passwordHash=await argon2.hash(password,{type:argon2.argon2id}); await client.query('INSERT INTO accounts(organization_id,email,password_hash,status,primary_role) VALUES($1,$2,$3,$4,$5)',[organizationId,item.email,passwordHash,'ACTIVE',item.role]); await client.query('UPDATE invitations SET used_at=now() WHERE id=$1',[item.id]); await this.auditAuth(client,organizationId,null,item.role,'INVITATION_REDEEMED',correlationId); }); }
+  private async principalFor(client: PoolClient, account: {id:string; organization_id:string; college_id:string; primary_role:Principal['role']; student_id?:string}): Promise<Principal> { const scopes=await client.query<{department_id:string}>('SELECT department_id FROM account_scopes WHERE account_id=$1 AND department_id IS NOT NULL',[account.id]); return {accountId:account.id,organizationId:account.organization_id,collegeId:account.college_id,role:account.primary_role,departmentIds:scopes.rows.map((scope)=>scope.department_id),...(account.student_id?{studentId:account.student_id}:{})}; }
+  private async auditAuth(client: PoolClient, organizationId:string, actorId:string|null, role:Principal['role']|null, action:string, correlationId:string): Promise<void> { await client.query('INSERT INTO audit_events(organization_id,actor_account_id,actor_role,action,entity_type,correlation_id) VALUES($1,$2,$3,$4,$5,$6)',[organizationId,actorId,role,action,'session',correlationId]); }
+}

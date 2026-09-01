@@ -1,0 +1,55 @@
+import 'dotenv/config';
+import crypto from 'node:crypto';
+import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
+import cookie from '@fastify/cookie';
+import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
+import rateLimit from '@fastify/rate-limit';
+import swagger from '@fastify/swagger';
+import swaggerUi from '@fastify/swagger-ui';
+import { z } from 'zod';
+import { loadConfig, type AppConfig } from '@dentpilot/config';
+import { Database } from './infrastructure/db.js';
+import { ObjectStorage } from './infrastructure/object-storage.js';
+import { AuthService, type Principal } from './security/auth.js';
+import { AuthorizationService } from './security/authorization.js';
+import { ApiProblem, sendProblem } from './security/errors.js';
+import { AuditService } from './modules/audit/service.js';
+import { StudentsService } from './modules/students/service.js';
+import { GroupsService } from './modules/groups/service.js';
+import { CasesService } from './modules/cases/service.js';
+import { ResultsService } from './modules/results/service.js';
+import { ReportingService } from './modules/reporting/service.js';
+
+const loginSchema=z.object({organizationId:z.string().uuid(),email:z.string().email().max(254),password:z.string().min(12).max(256)});
+const idempotencySchema=z.string().min(16).max(200).regex(/^[A-Za-z0-9._-]+$/);
+
+export interface ProductionCore { app: FastifyInstance; db: Database; config: AppConfig; }
+export async function buildApp(env: NodeJS.ProcessEnv=process.env): Promise<ProductionCore> {
+  const config=loadConfig(env); const db=new Database(config.DATABASE_URL); const storage=new ObjectStorage(config.MINIO_ENDPOINT,config.MINIO_ACCESS_KEY,config.MINIO_SECRET_KEY); await storage.ensureBucket(); const app=Fastify({logger:{level:env.NODE_ENV==='production'?'info':'warn'},bodyLimit:1024*1024,genReqId:()=>crypto.randomUUID()});
+  const auth=new AuthService(db,config.NODE_ENV==='production'); const authorization=new AuthorizationService(); const audit=new AuditService(); const students=new StudentsService(authorization,audit); const groups=new GroupsService(authorization,audit); const cases=new CasesService(authorization,audit); const results=new ResultsService(authorization,audit); const reporting=new ReportingService(authorization);
+  await app.register(cookie,{secret:config.SESSION_COOKIE_SECRET}); await app.register(helmet,{contentSecurityPolicy:{directives:{defaultSrc:["'none'"],frameAncestors:["'none'"]}}}); await app.register(cors,{origin:config.CORS_ORIGIN,credentials:true}); await app.register(rateLimit,{global:false}); await app.register(swagger,{openapi:{info:{title:'DentPilot University Production API',version:'v1.0-phase1'},servers:[{url:'/api/v1'}]}}); await app.register(swaggerUi,{routePrefix:'/docs'});
+  app.addHook('onResponse',async(request,reply)=>{ request.log.info({requestId:request.id,route:request.routeOptions.url,status:reply.statusCode},'request_completed'); });
+  app.setErrorHandler((error,request,reply)=>{ if(error instanceof ApiProblem) return sendProblem(reply,request.id,error); if(typeof error === 'object' && error !== null && 'statusCode' in error && error.statusCode === 429) return sendProblem(reply,request.id,new ApiProblem(429,'RATE_LIMITED','Too many requests. Retry later.')); if(error instanceof z.ZodError) { const details=Object.fromEntries(Object.entries(error.flatten().fieldErrors).filter((entry): entry is [string,string[]] => Array.isArray(entry[1]))); return sendProblem(reply,request.id,new ApiProblem(400,'VALIDATION_ERROR','Request validation failed.',details)); } const message=error instanceof Error ? error.message : 'unknown_error'; request.log.error({requestId:request.id,errorCode:'INTERNAL_ERROR',message},'request_failed'); return sendProblem(reply,request.id,new ApiProblem(500,'VALIDATION_ERROR','An internal error occurred.')); });
+  const principal=async(request:FastifyRequest):Promise<Principal>=>auth.authenticate(request);
+  const mutation=async(request:FastifyRequest):Promise<Principal>=>{ const p=await principal(request); await auth.assertCsrf(request,p); return p; };
+  app.get('/health/live',async()=>({status:'live'})); app.get('/health/ready',async(_request,reply)=>{ const ready=(await db.readiness()) && (await storage.readiness()); return reply.code(ready?200:503).send({status:ready?'ready':'not_ready'}); });
+  app.get('/openapi.json',async()=>app.swagger());
+  app.post('/api/v1/auth/login',{config:{rateLimit:{max:5,timeWindow:'1 minute'}}},async(request,reply)=>{ const body=loginSchema.parse(request.body); const session=await auth.login(body.organizationId,body.email,body.password,request.id); auth.setCookies(reply,session.sessionValue,session.csrfToken); return reply.code(204).send(); });
+  app.post('/api/v1/auth/logout',async(request,reply)=>{ const p=await mutation(request); await auth.logout(request,p,request.id); auth.clearCookies(reply); return reply.code(204).send(); });
+  app.get('/api/v1/session',async(request)=>{ const p=await principal(request); return {accountId:p.accountId,organizationId:p.organizationId,role:p.role,departmentIds:p.departmentIds}; });
+  app.post('/api/v1/invitations',async(request,reply)=>{ const p=await mutation(request); const body=z.object({email:z.string().email(),role:z.enum(['UNIVERSITY_ADMIN','DEPARTMENT_ADMIN','CLINICAL_SUPERVISOR','STUDENT_INTEGRATION'])}).parse(request.body); await db.withTenant(p,async(client)=>authorization.assert(client,p,'rosters:manage')); const token=await auth.issueInvitation(p,body.email,body.role,request.id); return reply.code(201).send({invitationToken:config.NODE_ENV==='development'?token:undefined}); });
+  app.post('/api/v1/invitations/redeem',async(request,reply)=>{ const body=z.object({organizationId:z.string().uuid(),token:z.string().min(40),password:z.string().min(12).max(256)}).parse(request.body); await auth.redeemInvitation(body.organizationId,body.token,body.password,request.id); return reply.code(204).send(); });
+  app.get('/api/v1/students',async(request)=>{ const p=await principal(request); const departmentId=z.object({departmentId:z.string().uuid().optional()}).parse(request.query).departmentId; return db.withTenant(p,(client)=>students.list(client,p,departmentId)); });
+  app.post('/api/v1/enrollments/:id/close',async(request,reply)=>{ const p=await mutation(request); const body=z.object({expectedRevision:z.number().int().positive(),reason:z.string().min(3).max(500),idempotencyKey:idempotencySchema}).parse(request.body); const id=z.object({id:z.string().uuid()}).parse(request.params).id; await db.withTenant(p,(client)=>students.closeEnrollment(client,p,id,body.expectedRevision,body.reason,request.id)); return reply.code(204).send(); });
+  app.post('/api/v1/groups/memberships',async(request,reply)=>{ const p=await mutation(request); const body=z.object({groupId:z.string().uuid(),enrollmentId:z.string().uuid(),departmentId:z.string().uuid(),studentId:z.string().uuid(),idempotencyKey:idempotencySchema}).parse(request.body); await db.withTenant(p,(client)=>groups.assignMembership(client,p,{...body,correlationId:request.id})); return reply.code(204).send(); });
+  app.post('/api/v1/student/submissions',async(request,reply)=>{ const p=await mutation(request); const body=z.object({draftId:z.string().uuid(),idempotencyKey:idempotencySchema}).parse(request.body); const result=await db.withTenant(p,(client)=>cases.submitDraft(client,p,{...body,correlationId:request.id})); return reply.code(201).send(result); });
+  app.get('/api/v1/staff/submissions/:id',async(request)=>{ const p=await principal(request); const id=z.object({id:z.string().uuid()}).parse(request.params).id; return db.withTenant(p,async(client)=>{ const row=await client.query<{id:string;department_id:string;supervisor_assignment_id:string;status:string;submitted_at:Date}>('SELECT id,department_id,supervisor_assignment_id,status,submitted_at FROM submission_snapshots WHERE id=$1',[id]); if(!row.rowCount) throw new ApiProblem(404,'NOT_FOUND','Submitted case not found.'); await authorization.assert(client,p,'cases:review',{departmentId:row.rows[0].department_id,assignmentId:row.rows[0].supervisor_assignment_id,assignmentPermission:'reviewCases'}); return row.rows[0]; }); });
+  app.post('/api/v1/staff/submissions/:id/revision-requests',async(request,reply)=>{ const p=await mutation(request); const id=z.object({id:z.string().uuid()}).parse(request.params).id; const body=z.object({reason:z.string().min(3).max(1000),idempotencyKey:idempotencySchema}).parse(request.body); await db.withTenant(p,(client)=>cases.requestRevision(client,p,id,body.reason,request.id)); return reply.code(204).send(); });
+  app.post('/api/v1/staff/submissions/:id/grades',async(request,reply)=>{ const p=await mutation(request); const id=z.object({id:z.string().uuid()}).parse(request.params).id; const body=z.object({grade:z.number().min(0).max(100),comment:z.string().min(1).max(2000),reason:z.string().max(1000).optional(),idempotencyKey:idempotencySchema}).parse(request.body); await db.withTenant(p,(client)=>cases.grade(client,p,{...body,snapshotId:id,correlationId:request.id})); return reply.code(204).send(); });
+  for(const target of ['reviewed','approved','locked','reopened'] as const) app.post(`/api/v1/term-results/:id/${target}`,async(request,reply)=>{ const p=await mutation(request); const id=z.object({id:z.string().uuid()}).parse(request.params).id; const body=z.object({reason:z.string().max(1000).optional(),idempotencyKey:idempotencySchema}).parse(request.body); await db.withTenant(p,(client)=>results.transition(client,p,id,target.toUpperCase() as 'REVIEWED'|'APPROVED'|'LOCKED'|'REOPENED',body.reason,request.id)); return reply.code(204).send(); });
+  app.get('/api/v1/reports/aggregate',async(request)=>{ const p=await principal(request); const query=z.object({academicYearId:z.string().uuid()}).parse(request.query); return db.withTenant(p,(client)=>reporting.aggregate(client,p,query.academicYearId)); });
+  app.post('/api/v1/files/presign-upload',async(request,reply)=>{ const p=await mutation(request); const body=z.object({contentType:z.string().regex(/^[a-z]+\/[a-z0-9.+-]+$/i),byteSize:z.number().int().positive().max(26214400),sha256:z.string().regex(/^[a-f0-9]{64}$/i)}).parse(request.body); const key=storage.createObjectKey(p.organizationId); const url=await storage.signedUpload(key,body.contentType); return reply.code(201).send({objectKey:key,uploadUrl:url,expiresInSeconds:300}); });
+  app.get('/api/v1/files/:id/presign-read',async(request)=>{ const p=await principal(request); const id=z.object({id:z.string().uuid()}).parse(request.params); return db.withTenant(p,async(client)=>{ const file=await client.query<{object_key:string}>('SELECT object_key FROM file_objects WHERE id=$1',[id.id]); if(!file.rowCount) throw new ApiProblem(404,'NOT_FOUND','File not found.'); await authorization.assert(client,p,'files:access'); return {readUrl:await storage.signedRead(file.rows[0].object_key),expiresInSeconds:300}; }); });
+  app.addHook('onClose',async()=>db.close()); return {app,db,config};
+}
