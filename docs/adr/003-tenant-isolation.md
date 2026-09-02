@@ -6,7 +6,7 @@
 
 ## Decision
 
-يأتي organizationId من session الخادمية فقط. يضبط `Database.withTenant()` متغير PostgreSQL `app.organization_id` داخل كل transaction، وتفرض RLS policy هذا المتغير على كل جدول مملوك لمستأجر. تضيف AuthorizationService scope checks فوق ذلك.
+يأتي organizationId من session الخادمية فقط. يضبط `Database.withTenant()` متغير PostgreSQL `app.organization_id` داخل كل transaction، وتفرض RLS policy هذا المتغير على كل جدول مملوك لمستأجر مع `FORCE ROW LEVEL SECURITY`. يعمل التطبيق بحساب `dentpilot_app` مستقل يحمل `NOSUPERUSER NOBYPASSRLS`؛ ويستخدم migration/seed حسابًا منفصلًا لا يصل إلى runtime. تضيف AuthorizationService scope checks فوق ذلك.
 
 ## Consequences
 

@@ -4,8 +4,8 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) throw new Error('DATABASE_URL is required.');
+const databaseUrl = process.env.MIGRATION_DATABASE_URL;
+if (!databaseUrl) throw new Error('MIGRATION_DATABASE_URL is required. Migrations must not run with the application credential.');
 const client = new pg.Client({ connectionString: databaseUrl });
 
 async function main(): Promise<void> {

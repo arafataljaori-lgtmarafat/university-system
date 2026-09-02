@@ -34,8 +34,9 @@ erDiagram
 | Distribution Policy → Group Membership | Full Cohort لا يسمح بعضوية group؛ Groups Enabled فقط يسمحها. | trigger `validate_group_membership` وفهرس عضوية نشطة وحيدة. |
 | Active Group Membership | لا يكون للـenrollment عضوان فعّالان في القسم نفسه. | partial unique index. |
 | Submission Snapshot → policy/template/assignment | يمنع إعادة تفسير الإرسال التاريخي بالقواعد الحالية. | references صريحة وpayload JSONB مجمد. |
+| Current submission state | يمنع وجود حقيقتين متعارضتين للحالة. | `case_sheets.current_status` فقط؛ لا status current داخل snapshots. |
 | Snapshot/Audit/Grade events | التاريخ الأكاديمي والتحقيق لا يقبلان التعديل أو الحذف. | triggers `reject_immutable_mutation`. |
-| Term Result Closure | لا يوجد قفل/فتح ضمن سياق ترم مكرر. | unique organization/department/term/level/cohort. |
+| Term Result Closure | لا يوجد قفل/فتح ضمن سياق ترم مكرر، والقفل يمنع تغيير الحالة/القرار/الدرجة. | unique organization/department/term/level/cohort + service and database lock guards. |
 | File Object | لا public key أو ملف خارج tenant. | object key server-generated، metadata وtenant column. |
 
 ## JSONB المبرر

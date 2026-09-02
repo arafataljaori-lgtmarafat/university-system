@@ -32,7 +32,7 @@ export function assertGradeAmendment(reason?: string): void {
 }
 
 export function assertGroupMembership(mode: DistributionMode, activeMemberships: number): void {
-  if (mode === 'FULL_COHORT' && activeMemberships > 0) throw new DomainError('CONFLICT', 'Group membership is forbidden for Full Cohort distribution.');
+  if (mode === 'FULL_COHORT') throw new DomainError('CONFLICT', 'Group membership is forbidden for Full Cohort distribution.');
   if (mode === 'GROUPS_ENABLED' && activeMemberships > 1) throw new DomainError('CONFLICT', 'An enrollment may have only one active group per department context.');
 }
 

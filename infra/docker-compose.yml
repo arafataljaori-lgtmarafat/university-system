@@ -3,17 +3,18 @@ services:
     image: postgres:16.8-alpine
     environment:
       POSTGRES_DB: dentpilot
-      POSTGRES_USER: dentpilot_app
-      POSTGRES_PASSWORD: development-only-change-me
+      POSTGRES_USER: dentpilot_owner
+      POSTGRES_PASSWORD: owner-development-only-change-me
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dentpilot_app -d dentpilot"]
+      test: ["CMD-SHELL", "pg_isready -U dentpilot_owner -d dentpilot"]
       interval: 5s
       timeout: 3s
       retries: 20
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: server /data --console-address ":9001"
